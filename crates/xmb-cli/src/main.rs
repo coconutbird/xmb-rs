@@ -11,7 +11,19 @@ use xmb::{XmbData, XmbFormat, XmbReader, XmbWriter};
 #[command(author, version, about = "XMB binary XML format converter for Halo Wars", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+
+    /// Files to convert (drag-and-drop mode). Auto-detects direction by extension.
+    #[arg(global = true)]
+    files: Vec<PathBuf>,
+
+    /// Output format for XML to XMB conversion (drag-and-drop mode)
+    #[arg(short, long, value_enum, default_value = "pc", global = true)]
+    format: FormatArg,
+
+    /// Overwrite existing files instead of adding _1, _2, etc.
+    #[arg(short = 'w', long, global = true)]
+    overwrite: bool,
 }
 
 #[derive(Subcommand)]
@@ -70,8 +82,13 @@ impl From<FormatArg> for XmbFormat {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    // If files are provided without a subcommand, use drag-and-drop mode
+    if cli.command.is_none() && !cli.files.is_empty() {
+        return process_files(&cli.files, cli.format, cli.overwrite);
+    }
+
     match cli.command {
-        Commands::ToXml { input, output } => {
+        Some(Commands::ToXml { input, output }) => {
             let output = output.unwrap_or_else(|| {
                 let mut p = input.clone();
                 p.set_extension("xml");
@@ -90,11 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Done!");
         }
 
-        Commands::ToXmb {
+        Some(Commands::ToXmb {
             input,
             output,
             format,
-        } => {
+        }) => {
             let output = output.unwrap_or_else(|| {
                 let mut p = input.clone();
                 p.set_extension("xmb");
@@ -118,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Done!");
         }
 
-        Commands::Info { input } => {
+        Some(Commands::Info { input }) => {
             let file = File::open(&input)?;
             let reader = BufReader::new(file);
             let xmb = XmbReader::read(reader)?;
@@ -139,7 +156,124 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("(empty document)");
             }
         }
+
+        None => {
+            // No command and no files - show help
+            eprintln!("No files provided. Use --help for usage information.");
+            eprintln!();
+            eprintln!("Drag and drop files onto the executable to convert them:");
+            eprintln!("  .xml files -> .xmb (PC format by default)");
+            eprintln!("  .xmb files -> .xml");
+            std::process::exit(1);
+        }
     }
 
     Ok(())
+}
+
+/// Generate an output path by appending the new extension.
+/// If `overwrite` is false and the file exists, adds "_1", "_2", etc.
+/// Example: file.xml -> file.xml.xmb, then file.xml_1.xmb, file.xml_2.xmb, etc.
+fn output_path(base: &PathBuf, new_ext: &str, overwrite: bool) -> PathBuf {
+    // Append extension: file.xml -> file.xml.xmb
+    let base_name = base.as_os_str().to_string_lossy();
+    let output_name = format!("{}.{}", base_name, new_ext);
+    let output = PathBuf::from(&output_name);
+
+    if overwrite || !output.exists() {
+        return output;
+    }
+
+    // File exists and not overwriting, add increment
+    // file.xml.xmb -> file.xml_1.xmb
+    for i in 1..1000 {
+        let candidate = PathBuf::from(format!("{}_{}.{}", base_name, i, new_ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    // Fallback (shouldn't happen)
+    output
+}
+
+/// Process files in drag-and-drop mode.
+fn process_files(
+    files: &[PathBuf],
+    format: FormatArg,
+    overwrite: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut success_count = 0;
+    let mut error_count = 0;
+
+    for file in files {
+        let ext = file
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        let result = match ext.as_str() {
+            "xml" => convert_xml_to_xmb(file, format, overwrite),
+            "xmb" => convert_xmb_to_xml(file, overwrite),
+            _ => {
+                eprintln!("Skipping {}: unknown extension", file.display());
+                continue;
+            }
+        };
+
+        match result {
+            Ok(output) => {
+                println!("Converted: {} -> {}", file.display(), output.display());
+                success_count += 1;
+            }
+            Err(e) => {
+                eprintln!("Error converting {}: {}", file.display(), e);
+                error_count += 1;
+            }
+        }
+    }
+
+    println!();
+    println!("Done! {} converted, {} errors", success_count, error_count);
+
+    if error_count > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Convert an XML file to XMB.
+fn convert_xml_to_xmb(
+    input: &PathBuf,
+    format: FormatArg,
+    overwrite: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let output = output_path(input, "xmb", overwrite);
+
+    let xml = std::fs::read_to_string(input)?;
+    let xmb = XmbData::from_xml(&xml)?;
+
+    let file = File::create(&output)?;
+    let writer = BufWriter::new(file);
+    XmbWriter::write(&xmb, writer, format.into())?;
+
+    Ok(output)
+}
+
+/// Convert an XMB file to XML.
+fn convert_xmb_to_xml(
+    input: &PathBuf,
+    overwrite: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let output = output_path(input, "xml", overwrite);
+
+    let file = File::open(input)?;
+    let reader = BufReader::new(file);
+    let xmb = XmbReader::read(reader)?;
+
+    let xml = xmb.to_xml();
+    std::fs::write(&output, xml)?;
+
+    Ok(output)
 }

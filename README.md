@@ -29,25 +29,37 @@ The binary will be at `target/release/xmb.exe` (Windows).
 
 ## Usage
 
-### Convert XMB to XML
+### Drag and Drop
+
+Just drag files onto the executable - it auto-detects the conversion direction:
+
+- `.xml` files → `.xml.xmb` (PC format by default)
+- `.xmb` files → `.xmb.xml`
 
 ```bash
-xmb to-xml -i input.xmb -o output.xml
+# Convert files (works with multiple files)
+xmb file1.xml file2.xmb file3.xml
+
+# Use Xbox 360 format for XML → XMB
+xmb -f xbox360 file.xml
+
+# Overwrite existing files instead of adding _1, _2, etc.
+xmb -w file.xml
 ```
 
-### Convert XML to XMB
+### Commands
 
 ```bash
-# PC format (default)
+# Convert XMB to XML
+xmb to-xml -i input.xmb -o output.xml
+
+# Convert XML to XMB (PC format)
 xmb to-xmb -i input.xml -o output.xmb
 
-# Xbox 360 format
+# Convert XML to XMB (Xbox 360 format)
 xmb to-xmb -i input.xml -o output.xmb -f xbox360
-```
 
-### Show File Info
-
-```bash
+# Show file info
 xmb info -i input.xmb
 ```
 
