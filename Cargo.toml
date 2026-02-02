@@ -1,0 +1,25 @@
+[package]
+name = "xmb-rs"
+version = "0.1.0"
+edition = "2021"
+description = "XMB binary XML format reader/writer for Halo Wars (Ensemble Studios)"
+license = "MIT"
+repository = "https://github.com/coconutbird/xmb-rs"
+
+[lib]
+name = "xmb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xmb"
+path = "src/main.rs"
+
+[dependencies]
+byteorder = "1.5"
+thiserror = "2"
+flate2 = "1"
+quick-xml = "0.39.0"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
