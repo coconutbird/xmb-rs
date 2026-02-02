@@ -5,9 +5,9 @@ use std::io::{Cursor, Read, Seek, Write};
 
 use crate::ecf::{EcfReader, EcfWriter, XMB_ECF_FILE_ID, XMX_PACKED_DATA_CHUNK_ID};
 use crate::error::{Error, Result};
-use crate::types::{Attribute, Node, XmbData};
+use crate::types::{Attribute, Node, XmbData, XmbFormat};
 use crate::variant::{
-    unpack_float24, unpack_fract24, unpack_int24, Variant, VariantType, OFFSET_FLAG, UNSIGNED_FLAG,
+    OFFSET_FLAG, UNSIGNED_FLAG, Variant, VariantType, unpack_float24, unpack_fract24, unpack_int24,
 };
 
 /// XMB data signature.
@@ -65,16 +65,16 @@ impl XmbReader {
             });
         }
 
-        // Parse based on detected endianness
+        // Parse based on detected format
         // Pass full buffer - offsets in the data are relative to buffer start
         if is_big_endian {
-            Self::parse_packed_data_be(data)
+            Self::parse_packed_data_xbox360(data)
         } else {
-            Self::parse_packed_data_le(data)
+            Self::parse_packed_data_pc(data)
         }
     }
 
-    /// Parse packed data in little-endian format (PC/DE version).
+    /// Parse packed data in PC format (Halo Wars Definitive Edition).
     ///
     /// The packed format from Halo Wars DE uses:
     /// - 4 bytes: signature (already validated)
@@ -87,7 +87,7 @@ impl XmbReader {
     /// - 8 bytes: mVariantData.mPtr (offset to variant data from buffer start)
     /// - Node data at mNodes.mPtr offset
     /// - Variant data at mVariantData.mPtr offset
-    fn parse_packed_data_le(data: &[u8]) -> Result<XmbData> {
+    fn parse_packed_data_pc(data: &[u8]) -> Result<XmbData> {
         let mut cursor = Cursor::new(data);
 
         // Skip signature (4 bytes) - already validated
@@ -325,7 +325,7 @@ impl XmbReader {
             .ok_or_else(|| Error::InvalidNode("Failed to build root node".to_string()))
     }
 
-    /// Parse packed data in big-endian format (Xbox 360 version / writer format).
+    /// Parse packed data in Xbox 360 format.
     ///
     /// This handles the format written by XmbWriter:
     /// - 4 bytes: signature (0x71439800)
@@ -337,7 +337,7 @@ impl XmbReader {
     /// - Node data (20 bytes per node)
     /// - Attribute data (8 bytes per attribute)
     /// - String table
-    fn parse_packed_data_be(data: &[u8]) -> Result<XmbData> {
+    fn parse_packed_data_xbox360(data: &[u8]) -> Result<XmbData> {
         let mut cursor = Cursor::new(data);
 
         // Read header
@@ -687,25 +687,12 @@ impl XmbReader {
 pub struct XmbWriter;
 
 impl XmbWriter {
-    /// Write an XMB document to a writer (defaults to LE/PC format).
-    pub fn write<W: Write + Seek>(xmb: &XmbData, writer: W) -> Result<()> {
-        Self::write_le(xmb, writer)
-    }
-
-    /// Write an XMB document in little-endian format (PC/HWDE).
-    pub fn write_le<W: Write + Seek>(xmb: &XmbData, writer: W) -> Result<()> {
-        let packed_data = Self::build_packed_data_le(xmb)?;
-
-        let mut ecf = EcfWriter::new(writer, XMB_ECF_FILE_ID);
-        ecf.add_chunk(XMX_PACKED_DATA_CHUNK_ID, packed_data);
-        ecf.finalize()?;
-
-        Ok(())
-    }
-
-    /// Write an XMB document in big-endian format (Xbox 360).
-    pub fn write_be<W: Write + Seek>(xmb: &XmbData, writer: W) -> Result<()> {
-        let packed_data = Self::build_packed_data_be(xmb)?;
+    /// Write an XMB document to a writer with the specified format.
+    pub fn write<W: Write + Seek>(xmb: &XmbData, writer: W, format: XmbFormat) -> Result<()> {
+        let packed_data = match format {
+            XmbFormat::PC => Self::build_packed_data_pc(xmb)?,
+            XmbFormat::Xbox360 => Self::build_packed_data_xbox360(xmb)?,
+        };
 
         let mut ecf = EcfWriter::new(writer, XMB_ECF_FILE_ID);
         ecf.add_chunk(XMX_PACKED_DATA_CHUNK_ID, packed_data);
@@ -718,15 +705,11 @@ impl XmbWriter {
     ///
     /// Uses `xmb.format()` to determine which format to use.
     pub fn write_native<W: Write + Seek>(xmb: &XmbData, writer: W) -> Result<()> {
-        if xmb.is_xbox360() {
-            Self::write_be(xmb, writer)
-        } else {
-            Self::write_le(xmb, writer)
-        }
+        Self::write(xmb, writer, xmb.format())
     }
 
-    /// Build the packed XMB data in big-endian format (Xbox 360).
-    fn build_packed_data_be(xmb: &XmbData) -> Result<Vec<u8>> {
+    /// Build the packed XMB data in Xbox 360 format.
+    fn build_packed_data_xbox360(xmb: &XmbData) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         let mut string_table = StringTable::new();
         let mut data_table = DataTable::new();
@@ -780,9 +763,9 @@ impl XmbWriter {
         Ok(data)
     }
 
-    /// Build the packed XMB data in little-endian format (PC/HWDE).
+    /// Build the packed XMB data in PC format (Halo Wars Definitive Edition).
     ///
-    /// LE format uses 48-byte nodes with BPackedArray for attributes and children.
+    /// PC format uses 48-byte nodes with BPackedArray for attributes and children.
     /// Header layout:
     /// - 4 bytes: signature
     /// - 4 bytes: padding
@@ -792,7 +775,7 @@ impl XmbWriter {
     /// - 4 bytes: mVariantData.mSize
     /// - 4 bytes: padding
     /// - 8 bytes: mVariantData.mPtr
-    fn build_packed_data_le(xmb: &XmbData) -> Result<Vec<u8>> {
+    fn build_packed_data_pc(xmb: &XmbData) -> Result<Vec<u8>> {
         let mut string_table = StringTableLe::new();
         let mut data_table = DataTableLe::new();
 

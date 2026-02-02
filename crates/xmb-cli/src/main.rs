@@ -109,12 +109,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let xml = std::fs::read_to_string(&input)?;
-            let mut xmb = XmbData::from_xml(&xml)?;
-            xmb.set_format(format.into());
+            let xmb = XmbData::from_xml(&xml)?;
 
             let file = File::create(&output)?;
             let writer = BufWriter::new(file);
-            XmbWriter::write_native(&xmb, writer)?;
+            XmbWriter::write(&xmb, writer, format.into())?;
 
             println!("Done!");
         }

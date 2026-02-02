@@ -1,0 +1,15 @@
+[package]
+name = "xmb-cli"
+version = "0.1.0"
+edition = "2024"
+description = "CLI tool for converting XMB binary XML files"
+license = "MIT"
+repository = "https://github.com/coconutbird/xmb-rs"
+
+[[bin]]
+name = "xmb"
+path = "src/main.rs"
+
+[dependencies]
+xmb = { path = "../xmb" }
+clap = { version = "4", features = ["derive"] }

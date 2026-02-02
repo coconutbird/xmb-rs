@@ -366,13 +366,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 
 [[package]]
-name = "xmb-rs"
+name = "xmb"
 version = "0.1.0"
 dependencies = [
  "byteorder",
- "clap",
  "flate2",
  "quick-xml",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "xmb-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "xmb",
 ]

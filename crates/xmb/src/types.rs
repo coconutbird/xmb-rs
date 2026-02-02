@@ -2,9 +2,9 @@
 
 use crate::error::{Error, Result};
 use crate::variant::Variant;
-use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
-use std::io::BufRead;
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::{Reader, Writer};
+use std::io::{BufRead, Cursor, Write};
 
 /// XMB format variant.
 ///
@@ -137,92 +137,62 @@ impl Node {
 
     /// Convert this node to XML string.
     pub fn to_xml(&self) -> String {
-        let mut output = String::new();
-        self.write_xml(&mut output, 0);
-        output
+        let mut buffer = Cursor::new(Vec::new());
+        self.write_xml_to(&mut buffer)
+            .expect("Failed to write XML to buffer");
+        String::from_utf8(buffer.into_inner()).expect("Invalid UTF-8 in XML output")
     }
 
-    /// Write this node as XML to a string with indentation.
-    fn write_xml(&self, output: &mut String, indent: usize) {
-        let indent_str = "  ".repeat(indent);
+    /// Write this node as XML to a writer using quick-xml.
+    pub fn write_xml_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        let mut xml_writer = Writer::new_with_indent(writer, b' ', 4);
+        self.write_node_xml(&mut xml_writer)?;
+        Ok(())
+    }
 
-        // Start tag
-        output.push_str(&indent_str);
-        output.push('<');
-        output.push_str(&escape_xml_name(&self.name));
-
-        // Attributes
-        for attr in &self.attributes {
-            output.push(' ');
-            output.push_str(&escape_xml_name(&attr.name));
-            output.push_str("=\"");
-            output.push_str(&escape_xml_value(&attr.value.to_string_value()));
-            output.push('"');
-        }
-
+    /// Recursively write this node and its children.
+    fn write_node_xml<W: Write>(&self, writer: &mut Writer<W>) -> Result<()> {
         let has_text = !matches!(self.text, Variant::Null);
         let has_children = !self.children.is_empty();
 
+        // Build start element with attributes
+        let mut elem = BytesStart::new(&self.name);
+        for attr in &self.attributes {
+            elem.push_attribute((attr.name.as_str(), attr.value.to_string_value().as_str()));
+        }
+
         if !has_text && !has_children {
             // Self-closing tag
-            output.push_str(" />\n");
+            writer
+                .write_event(Event::Empty(elem))
+                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         } else {
-            output.push('>');
+            // Start tag
+            writer
+                .write_event(Event::Start(elem.borrow()))
+                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-            if has_text && !has_children {
-                // Inline text content
-                output.push_str(&escape_xml_text(&self.text.to_string_value()));
-                output.push_str("</");
-                output.push_str(&escape_xml_name(&self.name));
-                output.push_str(">\n");
-            } else {
-                output.push('\n');
-
-                // Text content on its own line if present
-                if has_text {
-                    let text = self.text.to_string_value();
-                    if !text.is_empty() {
-                        output.push_str(&"  ".repeat(indent + 1));
-                        output.push_str(&escape_xml_text(&text));
-                        output.push('\n');
-                    }
-                }
-
-                // Children
-                for child in &self.children {
-                    child.write_xml(output, indent + 1);
-                }
-
-                // End tag
-                output.push_str(&indent_str);
-                output.push_str("</");
-                output.push_str(&escape_xml_name(&self.name));
-                output.push_str(">\n");
+            // Text content
+            if has_text {
+                let text = self.text.to_string_value();
+                writer
+                    .write_event(Event::Text(BytesText::new(&text)))
+                    .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
             }
+
+            // Children
+            for child in &self.children {
+                child.write_node_xml(writer)?;
+            }
+
+            // End tag
+            writer
+                .write_event(Event::End(BytesEnd::new(&self.name)))
+                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
+
+        Ok(())
     }
-}
-
-/// Escape special characters in XML attribute values.
-fn escape_xml_value(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// Escape special characters in XML text content.
-fn escape_xml_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// Escape/validate XML element/attribute names.
-fn escape_xml_name(s: &str) -> String {
-    // XML names can't start with numbers or contain certain characters
-    // For now, just return as-is since Halo Wars names should be valid
-    s.to_string()
 }
 
 /// XMB document data.
@@ -292,16 +262,30 @@ impl XmbData {
 
     /// Convert the XMB document to an XML string.
     pub fn to_xml(&self) -> String {
-        let mut output = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
-        if let Some(root) = &self.root {
-            output.push_str(&root.to_xml());
-        }
-        output
+        let mut buffer = Cursor::new(Vec::new());
+        self.write_xml_to(&mut buffer)
+            .expect("Failed to write XML to buffer");
+        String::from_utf8(buffer.into_inner()).expect("Invalid UTF-8 in XML output")
     }
 
-    /// Write the XMB document as XML to a writer.
-    pub fn write_xml<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        writer.write_all(self.to_xml().as_bytes())
+    /// Write the XMB document as XML to a writer using quick-xml.
+    pub fn write_xml_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        let mut xml_writer = Writer::new_with_indent(writer, b' ', 4);
+
+        // Write XML declaration
+        xml_writer
+            .write_event(Event::Decl(BytesDecl::new("1.0", Some("utf-8"), None)))
+            .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Write newline after declaration
+        xml_writer.get_mut().write_all(b"\n").map_err(Error::Io)?;
+
+        // Write root node
+        if let Some(root) = &self.root {
+            root.write_node_xml(&mut xml_writer)?;
+        }
+
+        Ok(())
     }
 
     /// Parse an XML string into XmbData.
@@ -312,7 +296,8 @@ impl XmbData {
     /// Parse XML from a reader into XmbData.
     pub fn from_xml_reader<R: BufRead>(reader: R) -> Result<Self> {
         let mut xml_reader = Reader::from_reader(reader);
-        xml_reader.config_mut().trim_text(true);
+        // Note: trim_text disabled because it breaks entity handling
+        // (text around &amp; etc. is split into separate events)
 
         let mut buf = Vec::new();
         let mut root: Option<Node> = None;
@@ -334,7 +319,11 @@ impl XmbData {
                     }
                 }
                 Ok(Event::End(_)) => {
-                    if let Some(node) = stack.pop() {
+                    if let Some(mut node) = stack.pop() {
+                        // Finalize accumulated text by parsing it into the appropriate type
+                        if let Variant::String(ref s) = node.text {
+                            node.text = parse_text_value(s);
+                        }
                         if let Some(parent) = stack.last_mut() {
                             parent.children.push(node);
                         } else {
@@ -343,13 +332,29 @@ impl XmbData {
                     }
                 }
                 Ok(Event::Text(ref e)) => {
+                    // decode() handles UTF-8 decoding
                     let text = e
                         .decode()
-                        .map_err(|e| Error::InvalidString(e.to_string()))?;
-                    let text_str = text.to_string();
-                    if !text_str.is_empty() {
-                        if let Some(node) = stack.last_mut() {
-                            node.text = parse_text_value(&text_str);
+                        .map_err(|err| Error::InvalidString(err.to_string()))?;
+
+                    if let Some(node) = stack.last_mut() {
+                        // Accumulate text (entities can cause multiple text events)
+                        match &node.text {
+                            Variant::Null => {
+                                // First text - skip if whitespace-only (indentation)
+                                if !text.trim().is_empty() {
+                                    node.text = Variant::String(text.into_owned());
+                                }
+                            }
+                            Variant::String(existing) => {
+                                // Append to existing text (preserve spaces in middle)
+                                node.text = Variant::String(format!("{}{}", existing, text));
+                            }
+                            _ => {
+                                // Already parsed as something else, append
+                                let existing = node.text_string();
+                                node.text = Variant::String(format!("{}{}", existing, text));
+                            }
                         }
                     }
                 }
@@ -362,6 +367,36 @@ impl XmbData {
                     }
                 }
                 Ok(Event::Eof) => break,
+                Ok(Event::GeneralRef(ref e)) => {
+                    // Handle entity references like &amp; &lt; etc.
+                    let entity = e.as_ref();
+                    let resolved = match entity {
+                        b"amp" => "&",
+                        b"lt" => "<",
+                        b"gt" => ">",
+                        b"quot" => "\"",
+                        b"apos" => "'",
+                        _ => "",
+                    };
+                    if !resolved.is_empty() {
+                        if let Some(node) = stack.last_mut() {
+                            match &node.text {
+                                Variant::Null => {
+                                    node.text = Variant::String(resolved.to_string());
+                                }
+                                Variant::String(existing) => {
+                                    node.text =
+                                        Variant::String(format!("{}{}", existing, resolved));
+                                }
+                                _ => {
+                                    let existing = node.text_string();
+                                    node.text =
+                                        Variant::String(format!("{}{}", existing, resolved));
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(_) => {} // Ignore comments, declarations, etc.
                 Err(e) => return Err(Error::InvalidString(format!("XML parse error: {}", e))),
             }

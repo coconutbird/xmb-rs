@@ -1,0 +1,9 @@
+﻿[toolchain]
+channel = "stable"
+profile = "default"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = [
+  "x86_64-pc-windows-msvc",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+]
