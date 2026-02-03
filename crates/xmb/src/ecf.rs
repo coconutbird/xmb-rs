@@ -2,28 +2,139 @@
 //!
 //! ECF is a container format used by Ensemble Studios to wrap various
 //! file types including XMB. The format uses big-endian byte order.
+//!
+//! ## ECF Structure
+//!
+//! An ECF file consists of:
+//! - ECF Header (32 bytes)
+//! - Chunk Headers (24 bytes each + optional extra data)
+//! - Chunk Data (optionally compressed)
+//!
+//! ## Compression
+//!
+//! Chunks can be compressed using BDeflateStream format, which wraps
+//! standard deflate compression with checksums and metadata.
 
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
+use flate2::Compression;
 use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
 
+// ============================================================================
+// ECF Chunk Resource Flags
+// ============================================================================
+
+/// ECF chunk resource flags.
+///
+/// These flags are stored in the `resource_flags` field of `EcfChunkHeader`.
+/// Based on the original Halo Wars source code enum `eECFChunkResourceFlags`.
+///
+/// In practice, only `IS_DEFLATE_STREAM` is commonly used in XMB files.
+/// The other flags relate to memory allocation hints for the game engine.
+pub mod chunk_resource_flags {
+    /// Bit 0: Memory is contiguous.
+    ///
+    /// Hint that the resource should be allocated in contiguous memory.
+    pub const CONTIGUOUS: u16 = 1 << 0;
+
+    /// Bit 1: Memory is write-combined.
+    ///
+    /// GPU optimization hint for write-combined memory allocation.
+    pub const WRITE_COMBINED: u16 = 1 << 1;
+
+    /// Bit 2: Chunk data is compressed using BDeflateStream format.
+    ///
+    /// When set, the chunk data is wrapped in a BDeflateStream container
+    /// with checksums and metadata. The reader will automatically decompress.
+    pub const IS_DEFLATE_STREAM: u16 = 1 << 2;
+
+    /// Bit 3: Chunk contains a resource tag.
+    ///
+    /// Indicates the chunk data includes resource tagging information.
+    pub const IS_RESOURCE_TAG: u16 = 1 << 3;
+}
+
 /// ECF resource flag indicating the chunk data is deflate compressed.
-const ECF_CHUNK_RES_FLAG_IS_DEFLATE_STREAM: u16 = 1 << 2;
+/// Use `chunk_resource_flags::IS_DEFLATE_STREAM` for the public constant.
+const ECF_CHUNK_RES_FLAG_IS_DEFLATE_STREAM: u16 = chunk_resource_flags::IS_DEFLATE_STREAM;
 
-/// BDeflateStream signature (little-endian).
-const DEFLATE_STREAM_SIG: u32 = 0xCC34EEAD;
+// ============================================================================
+// BDeflateStream Constants
+// ============================================================================
 
-/// BDeflateStream inverted signature (big-endian / byte-swapped).
-const DEFLATE_STREAM_INVERTED_SIG: u32 = 0xADEE34CC;
+/// BDeflateStream constants and types.
+///
+/// BDeflateStream is EA's custom compression wrapper format that adds
+/// checksums and metadata around standard deflate compression.
+pub mod deflate_stream {
+    /// BDeflateStream signature for little-endian format (PC).
+    ///
+    /// When read as little-endian u32, this is 0xCC34EEAD.
+    pub const SIGNATURE: u32 = 0xCC34EEAD;
 
-/// BDeflateStream header size in bytes.
-const DEFLATE_STREAM_HEADER_SIZE: usize = 36;
+    /// BDeflateStream inverted signature for big-endian format (Xbox 360).
+    ///
+    /// When the signature bytes are written as big-endian (0xCC, 0x34, 0xEE, 0xAD),
+    /// reading them as little-endian u32 yields 0xADEE34CC.
+    pub const SIGNATURE_INVERTED: u32 = 0xADEE34CC;
+
+    /// BDeflateStream header size in bytes.
+    ///
+    /// The header contains:
+    /// - 4 bytes: signature
+    /// - 4 bytes: header_adler32 (checksum of bytes 8-36)
+    /// - 8 bytes: src_bytes (uncompressed size)
+    /// - 4 bytes: src_adler32 (uncompressed data checksum)
+    /// - 8 bytes: dst_bytes (compressed size)
+    /// - 4 bytes: dst_adler32 (compressed data checksum)
+    /// - 4 bytes: header_type
+    pub const HEADER_SIZE: usize = 36;
+
+    /// BDeflateStream end magic value.
+    ///
+    /// Written after the compressed data as a terminator.
+    pub const END_MAGIC: u32 = 0xA5D91776;
+
+    /// BDeflateStream header type values.
+    ///
+    /// The header_type field indicates how the stream was compressed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(u32)]
+    pub enum HeaderType {
+        /// Size is known upfront (standard compression).
+        SizeKnown = 0,
+        /// Streaming mode where size was not known during compression.
+        Streaming = 1,
+    }
+
+    impl HeaderType {
+        /// Parse a header type from a raw u32 value.
+        pub fn from_u32(value: u32) -> Option<Self> {
+            match value {
+                0 => Some(HeaderType::SizeKnown),
+                1 => Some(HeaderType::Streaming),
+                _ => None,
+            }
+        }
+    }
+}
+
+// Internal aliases for backward compatibility
+const DEFLATE_STREAM_SIG: u32 = deflate_stream::SIGNATURE;
+const DEFLATE_STREAM_INVERTED_SIG: u32 = deflate_stream::SIGNATURE_INVERTED;
+const DEFLATE_STREAM_HEADER_SIZE: usize = deflate_stream::HEADER_SIZE;
+const DEFLATE_STREAM_END_MAGIC: u32 = deflate_stream::END_MAGIC;
+
+// ============================================================================
+// ECF Constants
+// ============================================================================
 
 /// ECF header magic number.
 pub const ECF_HEADER_MAGIC: u32 = 0xDABA7737;
-/// ECF inverted header magic (for little-endian detection).
+/// ECF inverted header magic (for little-endian detection, currently unused).
 pub const ECF_INVERTED_HEADER_MAGIC: u32 = 0x3777BADA;
 
 /// XMB ECF file ID.
@@ -333,6 +444,103 @@ impl<W: Write + Seek> EcfWriter<W> {
             resource_flags: 0,
         };
         self.chunks.push((chunk, data));
+    }
+
+    /// Add a compressed chunk to the ECF file using BDeflateStream format (little-endian, for PC).
+    pub fn add_chunk_compressed(&mut self, id: u64, data: Vec<u8>) -> Result<()> {
+        self.add_chunk_compressed_with_endian(id, data, false)
+    }
+
+    /// Add a compressed chunk to the ECF file using BDeflateStream format (big-endian, for Xbox 360).
+    pub fn add_chunk_compressed_be(&mut self, id: u64, data: Vec<u8>) -> Result<()> {
+        self.add_chunk_compressed_with_endian(id, data, true)
+    }
+
+    /// Add a compressed chunk to the ECF file using BDeflateStream format with specified endianness.
+    ///
+    /// # Arguments
+    /// * `id` - Chunk ID
+    /// * `data` - Uncompressed data to compress
+    /// * `big_endian` - If true, use big-endian format (Xbox 360); if false, use little-endian (PC)
+    pub fn add_chunk_compressed_with_endian(
+        &mut self,
+        id: u64,
+        data: Vec<u8>,
+        big_endian: bool,
+    ) -> Result<()> {
+        use std::io::Write;
+
+        let src_bytes = data.len() as u64;
+        let src_adler32 = adler32(&data);
+
+        // Compress the data using deflate
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&data)?;
+        let compressed_data = encoder.finish()?;
+        let dst_bytes = compressed_data.len() as u64;
+        let dst_adler32 = adler32(&compressed_data);
+
+        // Build BDeflateStream wrapper:
+        // Header (36 bytes):
+        //   - sig: u32 (0xCC34EEAD for native endian, appears as 0xADEE34CC when read as opposite endian)
+        //   - header_adler32: u32 (checksum of header bytes 8-36)
+        //   - src_bytes: u64 (uncompressed size)
+        //   - src_adler32: u32 (uncompressed data checksum)
+        //   - dst_bytes: u64 (compressed size)
+        //   - dst_adler32: u32 (compressed data checksum)
+        //   - header_type: u32 (0 = size known, 1 = streaming)
+        // Followed by:
+        //   - dst_bytes of raw deflate compressed data
+        //   - end magic: u32 (0xA5D91776)
+
+        // Build header bytes 8-36 first to compute header_adler32
+        let mut header_data = Vec::with_capacity(28);
+        if big_endian {
+            header_data.extend_from_slice(&src_bytes.to_be_bytes());
+            header_data.extend_from_slice(&src_adler32.to_be_bytes());
+            header_data.extend_from_slice(&dst_bytes.to_be_bytes());
+            header_data.extend_from_slice(&dst_adler32.to_be_bytes());
+            header_data.extend_from_slice(&0u32.to_be_bytes()); // header_type
+        } else {
+            header_data.extend_from_slice(&src_bytes.to_le_bytes());
+            header_data.extend_from_slice(&src_adler32.to_le_bytes());
+            header_data.extend_from_slice(&dst_bytes.to_le_bytes());
+            header_data.extend_from_slice(&dst_adler32.to_le_bytes());
+            header_data.extend_from_slice(&0u32.to_le_bytes()); // header_type
+        }
+        let header_adler32 = adler32(&header_data);
+
+        let total_size = DEFLATE_STREAM_HEADER_SIZE + compressed_data.len() + 4; // header + data + end magic
+
+        let mut wrapped_data = Vec::with_capacity(total_size);
+        if big_endian {
+            // For big-endian: signature bytes are written so that when read as LE u32,
+            // it appears as DEFLATE_STREAM_INVERTED_SIG (0xADEE34CC)
+            wrapped_data.extend_from_slice(&DEFLATE_STREAM_SIG.to_be_bytes());
+            wrapped_data.extend_from_slice(&header_adler32.to_be_bytes());
+        } else {
+            wrapped_data.extend_from_slice(&DEFLATE_STREAM_SIG.to_le_bytes());
+            wrapped_data.extend_from_slice(&header_adler32.to_le_bytes());
+        }
+        wrapped_data.extend_from_slice(&header_data);
+        wrapped_data.extend_from_slice(&compressed_data);
+        if big_endian {
+            wrapped_data.extend_from_slice(&DEFLATE_STREAM_END_MAGIC.to_be_bytes());
+        } else {
+            wrapped_data.extend_from_slice(&DEFLATE_STREAM_END_MAGIC.to_le_bytes());
+        }
+
+        let chunk = EcfChunkHeader {
+            id,
+            offset: 0, // Will be calculated on finalize
+            size: wrapped_data.len() as u32,
+            adler32: adler32(&wrapped_data),
+            flags: 0,
+            alignment_log2: 2, // 4-byte alignment
+            resource_flags: ECF_CHUNK_RES_FLAG_IS_DEFLATE_STREAM,
+        };
+        self.chunks.push((chunk, wrapped_data));
+        Ok(())
     }
 
     /// Finalize and write the ECF file.

@@ -325,30 +325,39 @@ impl XmbReader {
             .ok_or_else(|| Error::InvalidNode("Failed to build root node".to_string()))
     }
 
-    /// Parse packed data in Xbox 360 format.
+    /// Parse Xbox 360 XMB packed data format.
     ///
-    /// This handles the format written by XmbWriter:
-    /// - 4 bytes: signature (0x71439800)
-    /// - 4 bytes: flags
-    /// - 4 bytes: node count
-    /// - 4 bytes: attribute count
-    /// - 4 bytes: string table size
-    /// - 4 bytes: data table size
-    /// - Node data (20 bytes per node)
-    /// - Attribute data (8 bytes per attribute)
-    /// - String table
+    /// This handles two format variants:
+    /// 1. Original Halo Wars Xbox 360 format (PackedArray with 28-byte nodes)
+    /// 2. Simplified format written by XmbWriter (24-byte header, 20-byte nodes)
     fn parse_packed_data_xbox360(data: &[u8]) -> Result<XmbData> {
+        // Detect format variant by examining header structure
+        // Original format: sig(4) + nodes_size(4) + nodes_ptr(4) + ...
+        // Writer format:   sig(4) + flags(4) + node_count(4) + attr_count(4) + ...
+        //
+        // In original format, offset 8 is nodes_ptr (pointing to node data, typically 20)
+        // In writer format, offset 8 is node_count (typically small number like 1-100)
+        // Also check offset 4: in original format it's nodes_size, in writer format it's flags (0)
+
+        Self::parse_packed_data_xbox360_original(data)
+    }
+
+    /// Parse the original Halo Wars Xbox 360 XMB packed data format.
+    fn parse_packed_data_xbox360_original(data: &[u8]) -> Result<XmbData> {
+        if data.len() < 24 {
+            return Err(Error::InvalidNode("Xbox 360 data too short".into()));
+        }
+
         let mut cursor = Cursor::new(data);
 
-        // Read header
+        // Read header (20 bytes total)
         let _signature = cursor.read_u32::<BigEndian>()?;
-        let _flags = cursor.read_u32::<BigEndian>()?;
-        let num_nodes = cursor.read_u32::<BigEndian>()? as usize;
-        let num_attrs = cursor.read_u32::<BigEndian>()? as usize;
-        let string_table_size = cursor.read_u32::<BigEndian>()? as usize;
-        let _data_table_size = cursor.read_u32::<BigEndian>()?;
+        let nodes_size = cursor.read_u32::<BigEndian>()? as usize;
+        let nodes_ptr = cursor.read_u32::<BigEndian>()? as usize;
+        let variant_data_size = cursor.read_u32::<BigEndian>()? as usize;
+        let variant_data_ptr = cursor.read_u32::<BigEndian>()? as usize;
 
-        if num_nodes == 0 {
+        if nodes_size == 0 {
             return Ok(XmbData {
                 root: None,
                 format: crate::types::XmbFormat::Xbox360,
@@ -356,88 +365,104 @@ impl XmbReader {
             });
         }
 
-        // Calculate offsets
-        let header_size = 24;
-        let nodes_offset = header_size;
-        let attrs_offset = nodes_offset + num_nodes * 20;
-        let string_table_offset = attrs_offset + num_attrs * 8;
+        let variant_data = if variant_data_ptr < data.len() {
+            let end = (variant_data_ptr + variant_data_size).min(data.len());
+            &data[variant_data_ptr..end]
+        } else {
+            &data[0..0]
+        };
 
-        // Read nodes
-        let mut packed_nodes = Vec::with_capacity(num_nodes);
-        cursor.set_position(nodes_offset as u64);
-        for _ in 0..num_nodes {
-            let parent_index = cursor.read_i32::<BigEndian>()?;
-            let name_variant = cursor.read_u32::<BigEndian>()?;
-            let text_variant = cursor.read_u32::<BigEndian>()?;
-            let first_attr = cursor.read_u16::<BigEndian>()? as usize;
-            let num_attrs_node = cursor.read_u16::<BigEndian>()? as usize;
-            let first_child = cursor.read_u16::<BigEndian>()? as usize;
-            let num_children = cursor.read_u16::<BigEndian>()? as usize;
-
-            packed_nodes.push((
-                parent_index,
-                name_variant,
-                text_variant,
-                first_attr,
-                num_attrs_node,
-                first_child,
-                num_children,
-            ));
+        #[allow(dead_code)]
+        struct PackedNodeOrig {
+            parent: u32,
+            name: u32,
+            text: u32,
+            attrs_size: u32,
+            attrs_ptr: u32,
+            children_size: u32,
+            children_ptr: u32,
         }
 
-        // Read attributes
-        let mut attrs = Vec::with_capacity(num_attrs);
-        cursor.set_position(attrs_offset as u64);
-        for _ in 0..num_attrs {
-            let name_variant = cursor.read_u32::<BigEndian>()?;
-            let value_variant = cursor.read_u32::<BigEndian>()?;
-            attrs.push((name_variant, value_variant));
+        let mut packed_nodes = Vec::with_capacity(nodes_size);
+        cursor.set_position(nodes_ptr as u64);
+        for _ in 0..nodes_size {
+            packed_nodes.push(PackedNodeOrig {
+                parent: cursor.read_u32::<BigEndian>()?,
+                name: cursor.read_u32::<BigEndian>()?,
+                text: cursor.read_u32::<BigEndian>()?,
+                attrs_size: cursor.read_u32::<BigEndian>()?,
+                attrs_ptr: cursor.read_u32::<BigEndian>()?,
+                children_size: cursor.read_u32::<BigEndian>()?,
+                children_ptr: cursor.read_u32::<BigEndian>()?,
+            });
         }
 
-        // String table
-        let string_table = &data[string_table_offset
-            ..string_table_offset + string_table_size.min(data.len() - string_table_offset)];
+        fn read_attributes_orig(
+            data: &[u8],
+            attrs_size: u32,
+            attrs_ptr: u32,
+            variant_data: &[u8],
+        ) -> Result<Vec<Attribute>> {
+            if attrs_size == 0 || attrs_ptr == 0xFFFFFFFF {
+                return Ok(Vec::new());
+            }
+            let mut attrs = Vec::with_capacity(attrs_size as usize);
+            let mut cursor = Cursor::new(data);
+            cursor.set_position(attrs_ptr as u64);
+            for _ in 0..attrs_size {
+                let name_variant = cursor.read_u32::<BigEndian>()?;
+                let value_variant = cursor.read_u32::<BigEndian>()?;
+                let name = XmbReader::decode_variant_string_be(name_variant, variant_data)?;
+                let value = XmbReader::decode_variant_to_variant_be(value_variant, variant_data)?;
+                attrs.push(Attribute { name, value });
+            }
+            Ok(attrs)
+        }
 
-        // Build nodes recursively
-        fn build_node(
+        fn read_children_indices_orig(
+            data: &[u8],
+            children_size: u32,
+            children_ptr: u32,
+        ) -> Result<Vec<u32>> {
+            if children_size == 0 || children_ptr == 0xFFFFFFFF {
+                return Ok(Vec::new());
+            }
+            let mut indices = Vec::with_capacity(children_size as usize);
+            let mut cursor = Cursor::new(data);
+            cursor.set_position(children_ptr as u64);
+            for _ in 0..children_size {
+                indices.push(cursor.read_u32::<BigEndian>()?);
+            }
+            Ok(indices)
+        }
+
+        fn build_node_orig(
             idx: usize,
-            packed_nodes: &[(i32, u32, u32, usize, usize, usize, usize)],
-            attrs: &[(u32, u32)],
-            string_table: &[u8],
+            packed_nodes: &[PackedNodeOrig],
+            data: &[u8],
+            variant_data: &[u8],
         ) -> Result<Node> {
-            let (_, name_variant, text_variant, first_attr, num_attrs, first_child, num_children) =
-                packed_nodes[idx];
-
-            // Decode name
-            let name = XmbReader::decode_variant_string_be(name_variant, string_table)?;
-
-            // Decode text
-            let text = if text_variant != 0 {
-                XmbReader::decode_variant_to_variant_be(text_variant, string_table)?
+            let pn = &packed_nodes[idx];
+            let name = XmbReader::decode_variant_string_be(pn.name, variant_data)?;
+            let text = if pn.text != 0 {
+                XmbReader::decode_variant_to_variant_be(pn.text, variant_data)?
             } else {
                 Variant::Null
             };
-
-            // Decode attributes
-            let mut attributes = Vec::with_capacity(num_attrs);
-            for i in 0..num_attrs {
-                let (attr_name, attr_value) = attrs[first_attr + i];
-                let name = XmbReader::decode_variant_string_be(attr_name, string_table)?;
-                let value = XmbReader::decode_variant_to_variant_be(attr_value, string_table)?;
-                attributes.push(Attribute { name, value });
+            let attributes = read_attributes_orig(data, pn.attrs_size, pn.attrs_ptr, variant_data)?;
+            let children_indices =
+                read_children_indices_orig(data, pn.children_size, pn.children_ptr)?;
+            let mut children = Vec::with_capacity(children_indices.len());
+            for child_idx in children_indices {
+                if (child_idx as usize) < packed_nodes.len() {
+                    children.push(build_node_orig(
+                        child_idx as usize,
+                        packed_nodes,
+                        data,
+                        variant_data,
+                    )?);
+                }
             }
-
-            // Build children
-            let mut children = Vec::with_capacity(num_children);
-            for i in 0..num_children {
-                children.push(build_node(
-                    first_child + i,
-                    packed_nodes,
-                    attrs,
-                    string_table,
-                )?);
-            }
-
             Ok(Node {
                 name,
                 text,
@@ -446,8 +471,7 @@ impl XmbReader {
             })
         }
 
-        let root = build_node(0, &packed_nodes, &attrs, string_table)?;
-
+        let root = build_node_orig(0, &packed_nodes, data, variant_data)?;
         Ok(XmbData {
             root: Some(root),
             format: crate::types::XmbFormat::Xbox360,
@@ -478,23 +502,128 @@ impl XmbReader {
     }
 
     /// Decode a variant to Variant enum for big-endian format.
-    fn decode_variant_to_variant_be(variant_value: u32, string_table: &[u8]) -> Result<Variant> {
+    fn decode_variant_to_variant_be(variant_value: u32, variant_data: &[u8]) -> Result<Variant> {
+        use crate::variant;
+
         let type_bits = (variant_value >> 24) as u8;
         let data_bits = variant_value & 0xFFFFFF;
         let variant_type = type_bits & 0x0F;
         let is_offset = (type_bits & 0x80) != 0;
+        let is_unsigned = (type_bits & variant::UNSIGNED_FLAG) != 0;
+        // Vector size encoding: bits 5-6 store 0, 1, 2 for 2, 3, 4 components
+        let vec_size = 2 + ((type_bits & variant::VEC_SIZE_MASK) >> variant::VEC_SIZE_SHIFT);
 
         match variant_type {
-            0 => Ok(Variant::Null),
-            7 => Ok(Variant::Bool(data_bits != 0)),
+            0 => Ok(Variant::Null), // cXMXVTNull
+            1 => {
+                // cXMXVTFloat24 - 24-bit float, always direct
+                Ok(Variant::Float(variant::unpack_float24(data_bits)))
+            }
+            2 => {
+                // cXMXVTFloat - 32-bit float, always offset
+                if is_offset && (data_bits as usize + 4) <= variant_data.len() {
+                    let offset = data_bits as usize;
+                    let bytes = &variant_data[offset..offset + 4];
+                    let f = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    Ok(Variant::Float(f))
+                } else {
+                    Ok(Variant::Float(0.0))
+                }
+            }
+            3 => {
+                // cXMXVTInt24 - 24-bit integer, always direct
+                if is_unsigned {
+                    Ok(Variant::UInt(data_bits))
+                } else {
+                    // Sign extend from 24 bits
+                    let val = if data_bits & 0x800000 != 0 {
+                        (data_bits | 0xFF000000) as i32
+                    } else {
+                        data_bits as i32
+                    };
+                    Ok(Variant::Int(val))
+                }
+            }
+            4 => {
+                // cXMXVTInt32 - 32-bit integer, always offset
+                if is_offset && (data_bits as usize + 4) <= variant_data.len() {
+                    let offset = data_bits as usize;
+                    let bytes = &variant_data[offset..offset + 4];
+                    let val = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    Ok(Variant::Int(val))
+                } else {
+                    Ok(Variant::Int(0))
+                }
+            }
+            5 => {
+                // cXMXVTFract24 - 24-bit fixed point (value * 10000), always direct
+                Ok(Variant::Float(variant::unpack_fract24(data_bits)))
+            }
+            6 => {
+                // cXMXVTDouble - 64-bit double, always offset
+                if is_offset && (data_bits as usize + 8) <= variant_data.len() {
+                    let offset = data_bits as usize;
+                    let bytes = &variant_data[offset..offset + 8];
+                    let d = f64::from_be_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
+                    Ok(Variant::Float(d as f32))
+                } else {
+                    Ok(Variant::Float(0.0))
+                }
+            }
+            7 => Ok(Variant::Bool(data_bits != 0)), // cXMXVTBool
             8 => {
-                // ANSI String
+                // cXMXVTString - ANSI string
                 let s = if is_offset {
-                    Self::read_null_terminated_string(string_table, data_bits as usize)?
+                    Self::read_null_terminated_string(variant_data, data_bits as usize)?
                 } else {
                     Self::decode_direct_string(data_bits)?
                 };
                 Ok(Variant::String(s))
+            }
+            9 => {
+                // cXMXVTUString - Unicode string (read as UTF-16 BE)
+                if is_offset && (data_bits as usize) < variant_data.len() {
+                    let offset = data_bits as usize;
+                    let mut chars = Vec::new();
+                    let mut i = offset;
+                    while i + 1 < variant_data.len() {
+                        let wchar = u16::from_be_bytes([variant_data[i], variant_data[i + 1]]);
+                        if wchar == 0 {
+                            break;
+                        }
+                        chars.push(wchar);
+                        i += 2;
+                    }
+                    Ok(Variant::String(
+                        String::from_utf16(&chars).unwrap_or_else(|_| String::new()),
+                    ))
+                } else {
+                    Ok(Variant::String(String::new()))
+                }
+            }
+            10 => {
+                // cXMXVTFloatVec - float vector (2, 3, or 4 components)
+                if is_offset && (data_bits as usize + (vec_size as usize * 4)) <= variant_data.len()
+                {
+                    let offset = data_bits as usize;
+                    let mut floats = Vec::with_capacity(vec_size as usize);
+                    for i in 0..vec_size as usize {
+                        let fo = offset + i * 4;
+                        let f = f32::from_be_bytes([
+                            variant_data[fo],
+                            variant_data[fo + 1],
+                            variant_data[fo + 2],
+                            variant_data[fo + 3],
+                        ]);
+                        floats.push(f);
+                    }
+                    Ok(Variant::FloatVec(floats))
+                } else {
+                    Ok(Variant::FloatVec(vec![0.0; vec_size as usize]))
+                }
             }
             _ => Ok(Variant::String(format!("<variant:{}>", variant_type))),
         }
@@ -688,14 +817,50 @@ pub struct XmbWriter;
 
 impl XmbWriter {
     /// Write an XMB document to a writer with the specified format.
+    ///
+    /// Uses deflate compression by default. Use `write_uncompressed` to disable compression.
     pub fn write<W: Write + Seek>(xmb: &XmbData, writer: W, format: XmbFormat) -> Result<()> {
+        Self::write_with_options(xmb, writer, format, true)
+    }
+
+    /// Write an XMB document without compression.
+    pub fn write_uncompressed<W: Write + Seek>(
+        xmb: &XmbData,
+        writer: W,
+        format: XmbFormat,
+    ) -> Result<()> {
+        Self::write_with_options(xmb, writer, format, false)
+    }
+
+    /// Write an XMB document with explicit compression option.
+    ///
+    /// When compression is enabled, the appropriate endianness is used:
+    /// - PC format: little-endian BDeflateStream
+    /// - Xbox 360 format: big-endian BDeflateStream
+    pub fn write_with_options<W: Write + Seek>(
+        xmb: &XmbData,
+        writer: W,
+        format: XmbFormat,
+        compress: bool,
+    ) -> Result<()> {
         let packed_data = match format {
             XmbFormat::PC => Self::build_packed_data_pc(xmb)?,
             XmbFormat::Xbox360 => Self::build_packed_data_xbox360(xmb)?,
         };
 
         let mut ecf = EcfWriter::new(writer, XMB_ECF_FILE_ID);
-        ecf.add_chunk(XMX_PACKED_DATA_CHUNK_ID, packed_data);
+        if compress {
+            // Use appropriate endianness for compression based on target format
+            match format {
+                XmbFormat::PC => ecf.add_chunk_compressed(XMX_PACKED_DATA_CHUNK_ID, packed_data)?,
+                XmbFormat::Xbox360 => {
+                    ecf.add_chunk_compressed_be(XMX_PACKED_DATA_CHUNK_ID, packed_data)?
+                }
+            }
+        } else {
+            ecf.add_chunk(XMX_PACKED_DATA_CHUNK_ID, packed_data);
+        }
+
         ecf.finalize()?;
 
         Ok(())
@@ -704,63 +869,210 @@ impl XmbWriter {
     /// Write an XMB document in its native format (the format it was read from).
     ///
     /// Uses `xmb.format()` to determine which format to use.
+    /// Uses compression by default.
     pub fn write_native<W: Write + Seek>(xmb: &XmbData, writer: W) -> Result<()> {
         Self::write(xmb, writer, xmb.format())
     }
 
-    /// Build the packed XMB data in Xbox 360 format.
+    /// Build the packed XMB data in original Xbox 360 format.
+    ///
+    /// Original format layout:
+    /// - Header (20 bytes): signature, nodes_size, nodes_ptr, variant_data_size, variant_data_ptr
+    /// - Nodes array (28 bytes each): parent, name, text, attrs_size, attrs_ptr, children_size, children_ptr
+    /// - Attributes arrays (8 bytes each): name_variant, value_variant
+    /// - Children index arrays (4 bytes each): child node index
+    /// - Variant data: string table + data table
     fn build_packed_data_xbox360(xmb: &XmbData) -> Result<Vec<u8>> {
-        let mut data = Vec::new();
-        let mut string_table = StringTable::new();
-        let mut data_table = DataTable::new();
-
-        // Collect all nodes, attributes
-        let mut nodes: Vec<PackedNode> = Vec::new();
-        let mut attributes: Vec<PackedAttribute> = Vec::new();
+        // Collect all nodes in depth-first order
+        let mut collected_nodes: Vec<Xbox360NodeData> = Vec::new();
+        let mut variant_data = VariantDataBuilder::new();
 
         if let Some(root) = &xmb.root {
-            Self::collect_nodes(
-                root,
-                -1,
-                &mut nodes,
-                &mut attributes,
-                &mut string_table,
-                &mut data_table,
-            )?;
+            Self::collect_nodes_xbox360(root, 0xFFFFFFFF, &mut collected_nodes, &mut variant_data)?;
         }
 
-        // Write header
-        data.write_u32::<BigEndian>(XMB_SIGNATURE)?;
-        data.write_u32::<BigEndian>(0)?; // flags
-        data.write_u32::<BigEndian>(nodes.len() as u32)?;
-        data.write_u32::<BigEndian>(attributes.len() as u32)?;
-        data.write_u32::<BigEndian>(string_table.data.len() as u32)?;
-        data.write_u32::<BigEndian>(data_table.data.len() as u32)?;
+        if collected_nodes.is_empty() {
+            // Empty document
+            let mut data = Vec::new();
+            data.write_u32::<BigEndian>(XMB_SIGNATURE)?;
+            data.write_u32::<BigEndian>(0)?; // nodes_size
+            data.write_u32::<BigEndian>(0)?; // nodes_ptr
+            data.write_u32::<BigEndian>(0)?; // variant_data_size
+            data.write_u32::<BigEndian>(0)?; // variant_data_ptr
+            return Ok(data);
+        }
 
-        // Write nodes
-        for node in &nodes {
-            data.write_i32::<BigEndian>(node.parent_index)?;
+        // Calculate layout
+        let header_size = 20u32;
+        let nodes_ptr = header_size;
+        let nodes_size = collected_nodes.len() as u32;
+        let nodes_array_size = nodes_size * 28;
+
+        // Calculate where attributes and children arrays go
+        let mut current_offset = nodes_ptr + nodes_array_size;
+
+        // Assign pointers for each node's attributes and children
+        let mut node_attrs_ptrs: Vec<u32> = Vec::with_capacity(collected_nodes.len());
+        let mut node_children_ptrs: Vec<u32> = Vec::with_capacity(collected_nodes.len());
+
+        for node in &collected_nodes {
+            if node.attributes.is_empty() {
+                node_attrs_ptrs.push(0xFFFFFFFF);
+            } else {
+                node_attrs_ptrs.push(current_offset);
+                current_offset += (node.attributes.len() as u32) * 8;
+            }
+
+            if node.children_indices.is_empty() {
+                node_children_ptrs.push(0xFFFFFFFF);
+            } else {
+                node_children_ptrs.push(current_offset);
+                current_offset += (node.children_indices.len() as u32) * 4;
+            }
+        }
+
+        let variant_data_ptr = current_offset;
+
+        // Apply fixups to all variant values that reference data_table
+        // This adjusts offsets to account for the final string_data size
+        for node in &mut collected_nodes {
+            node.text_variant = variant_data.fixup_variant(node.text_variant);
+            for (name_var, value_var) in &mut node.attributes {
+                *name_var = variant_data.fixup_variant(*name_var);
+                *value_var = variant_data.fixup_variant(*value_var);
+            }
+        }
+
+        let variant_data_bytes = variant_data.finish();
+        let variant_data_size = variant_data_bytes.len() as u32;
+
+        // Now write everything
+        let mut data = Vec::new();
+
+        // Header (20 bytes)
+        data.write_u32::<BigEndian>(XMB_SIGNATURE)?;
+        data.write_u32::<BigEndian>(nodes_size)?;
+        data.write_u32::<BigEndian>(nodes_ptr)?;
+        data.write_u32::<BigEndian>(variant_data_size)?;
+        data.write_u32::<BigEndian>(variant_data_ptr)?;
+
+        // Nodes array (28 bytes each)
+        for (i, node) in collected_nodes.iter().enumerate() {
+            data.write_u32::<BigEndian>(node.parent_index)?;
             data.write_u32::<BigEndian>(node.name_variant)?;
             data.write_u32::<BigEndian>(node.text_variant)?;
-            data.write_u16::<BigEndian>(node.first_attr)?;
-            data.write_u16::<BigEndian>(node.num_attrs)?;
-            data.write_u16::<BigEndian>(node.first_child)?;
-            data.write_u16::<BigEndian>(node.num_children)?;
+            data.write_u32::<BigEndian>(node.attributes.len() as u32)?;
+            data.write_u32::<BigEndian>(node_attrs_ptrs[i])?;
+            data.write_u32::<BigEndian>(node.children_indices.len() as u32)?;
+            data.write_u32::<BigEndian>(node_children_ptrs[i])?;
         }
 
-        // Write attributes
-        for attr in &attributes {
-            data.write_u32::<BigEndian>(attr.name_variant)?;
-            data.write_u32::<BigEndian>(attr.value_variant)?;
+        // Attributes and children arrays (interleaved per node to match pointer layout)
+        for node in &collected_nodes {
+            // Write this node's attributes
+            for (name_var, value_var) in &node.attributes {
+                data.write_u32::<BigEndian>(*name_var)?;
+                data.write_u32::<BigEndian>(*value_var)?;
+            }
+
+            // Write this node's children indices
+            for child_idx in &node.children_indices {
+                data.write_u32::<BigEndian>(*child_idx)?;
+            }
         }
 
-        // Write string table
-        data.extend_from_slice(&string_table.data);
-
-        // Write data table (for Double, FloatVec, Int32, Float values)
-        data.extend_from_slice(&data_table.data);
+        // Variant data (string table + data table)
+        data.extend_from_slice(&variant_data_bytes);
 
         Ok(data)
+    }
+
+    /// Collect nodes for original Xbox 360 format.
+    fn collect_nodes_xbox360(
+        node: &Node,
+        parent_index: u32,
+        collected: &mut Vec<Xbox360NodeData>,
+        variant_data: &mut VariantDataBuilder,
+    ) -> Result<u32> {
+        let my_index = collected.len() as u32;
+
+        // Pack name and text variants
+        let name_variant = variant_data.add_string(&node.name);
+        let text_variant = Self::pack_variant_xbox360(&node.text, variant_data);
+
+        // Pack attributes
+        let mut attributes = Vec::with_capacity(node.attributes.len());
+        for attr in &node.attributes {
+            let attr_name = variant_data.add_string(&attr.name);
+            let attr_value = Self::pack_variant_xbox360(&attr.value, variant_data);
+            attributes.push((attr_name, attr_value));
+        }
+
+        // Add placeholder node (children_indices will be filled after recursion)
+        collected.push(Xbox360NodeData {
+            parent_index,
+            name_variant,
+            text_variant,
+            attributes,
+            children_indices: Vec::new(),
+        });
+
+        // Process children and collect their indices
+        let mut children_indices = Vec::with_capacity(node.children.len());
+        for child in &node.children {
+            let child_idx = Self::collect_nodes_xbox360(child, my_index, collected, variant_data)?;
+
+            children_indices.push(child_idx);
+        }
+
+        // Update node with children indices
+        collected[my_index as usize].children_indices = children_indices;
+
+        Ok(my_index)
+    }
+
+    /// Pack a variant for Xbox 360 format.
+    fn pack_variant_xbox360(variant: &Variant, variant_data: &mut VariantDataBuilder) -> u32 {
+        use crate::variant;
+        match variant {
+            Variant::Null => 0,
+            Variant::Bool(v) => ((VariantType::Bool as u32) << 24) | (if *v { 1 } else { 0 }),
+            Variant::Int(v) => {
+                // Use Int24 for small values, Int32 for larger
+                if *v >= -8_388_608 && *v <= 8_388_607 {
+                    // Int24 type (3) with data in lower 24 bits
+                    ((VariantType::Int24 as u32) << 24) | variant::pack_int24(*v)
+                } else {
+                    variant_data.add_int32(*v)
+                }
+            }
+            Variant::UInt(v) => {
+                // Unsigned integers - use Int24 with unsigned flag for small values
+                if *v <= 0xFFFFFF {
+                    // Int24 type (3) with unsigned flag (0x40) and data in lower 24 bits
+                    ((VariantType::Int24 as u32 | (variant::UNSIGNED_FLAG as u32)) << 24)
+                        | variant::pack_uint24(*v)
+                } else {
+                    // Store as Int32 (will lose unsigned info but preserve value)
+                    variant_data.add_int32(*v as i32)
+                }
+            }
+            Variant::Float(v) => {
+                // Use Float24 for values that fit, otherwise Float32
+                let packed24 = variant::pack_float24(*v);
+                let unpacked = variant::unpack_float24(packed24);
+                if (unpacked - *v).abs() < 0.001 || *v == 0.0 {
+                    // Float24 type (1) with data in lower 24 bits
+                    ((VariantType::Float24 as u32) << 24) | packed24
+                } else {
+                    variant_data.add_float(*v)
+                }
+            }
+            Variant::Double(v) => variant_data.add_double(*v),
+            Variant::FloatVec(vec) => variant_data.add_float_vec(vec),
+            Variant::String(s) => variant_data.add_string(s),
+            Variant::UString(s) => variant_data.add_ustring(s),
+        }
     }
 
     /// Build the packed XMB data in PC format (Halo Wars Definitive Edition).
@@ -1005,105 +1317,6 @@ impl XmbWriter {
             Variant::FloatVec(v) => data_table.add_float_vec(v),
         }
     }
-
-    /// Recursively collect nodes and attributes.
-    fn collect_nodes(
-        node: &Node,
-        parent_index: i32,
-        nodes: &mut Vec<PackedNode>,
-        attributes: &mut Vec<PackedAttribute>,
-        string_table: &mut StringTable,
-        data_table: &mut DataTable,
-    ) -> Result<u32> {
-        let node_index = nodes.len() as u32;
-        let first_attr = attributes.len() as u16;
-        let num_attrs = node.attributes.len() as u16;
-
-        // Add placeholder node
-        nodes.push(PackedNode {
-            parent_index,
-            name_variant: string_table.add_string(&node.name),
-            text_variant: Self::pack_variant(&node.text, string_table, data_table),
-            first_attr,
-            num_attrs,
-            first_child: 0,
-            num_children: 0,
-        });
-
-        // Add attributes
-        for attr in &node.attributes {
-            attributes.push(PackedAttribute {
-                name_variant: string_table.add_string(&attr.name),
-                value_variant: Self::pack_variant(&attr.value, string_table, data_table),
-            });
-        }
-
-        // Process children
-        let first_child = nodes.len() as u16;
-        let num_children = node.children.len() as u16;
-        for child in &node.children {
-            Self::collect_nodes(
-                child,
-                node_index as i32,
-                nodes,
-                attributes,
-                string_table,
-                data_table,
-            )?;
-        }
-
-        // Update node with child info
-        nodes[node_index as usize].first_child = first_child;
-        nodes[node_index as usize].num_children = num_children;
-
-        Ok(node_index)
-    }
-
-    /// Pack a variant value.
-    fn pack_variant(
-        variant: &Variant,
-        string_table: &mut StringTable,
-        data_table: &mut DataTable,
-    ) -> u32 {
-        match variant {
-            Variant::Null => 0,
-            Variant::Bool(v) => {
-                let value = if *v { 1u32 } else { 0u32 };
-                (VariantType::Bool as u32) << 24 | value
-            }
-            Variant::Int(v) => {
-                // Use Int24 if it fits, otherwise Int32
-                if *v >= -8388607 && *v <= 8388607 {
-                    let packed = crate::variant::pack_int24(*v);
-                    (VariantType::Int24 as u32) << 24 | packed
-                } else {
-                    data_table.add_int32(*v)
-                }
-            }
-            Variant::UInt(v) => {
-                // Use Int24 (unsigned) if it fits, otherwise Int32
-                if *v <= 0xFFFFFF {
-                    ((VariantType::Int24 as u32 | UNSIGNED_FLAG as u32) << 24) | *v
-                } else {
-                    data_table.add_int32(*v as i32)
-                }
-            }
-            Variant::Float(v) => {
-                // Use Float24 for common values, Float32 for precision
-                let packed = crate::variant::pack_float24(*v);
-                let unpacked = crate::variant::unpack_float24(packed);
-                if (*v - unpacked).abs() < 0.001 || *v == 0.0 {
-                    (VariantType::Float24 as u32) << 24 | packed
-                } else {
-                    data_table.add_float(*v)
-                }
-            }
-            Variant::Double(v) => data_table.add_double(*v),
-            Variant::String(s) => string_table.add_string(s),
-            Variant::UString(s) => string_table.add_ustring(s),
-            Variant::FloatVec(v) => data_table.add_float_vec(v),
-        }
-    }
 }
 
 /// Packed node structure for reading (LE packed format with embedded arrays).
@@ -1116,103 +1329,130 @@ struct PackedNodeRead {
     children: Vec<u32>,          // child indices
 }
 
-/// Packed node structure for writing.
-struct PackedNode {
-    parent_index: i32,
+/// Node data for Xbox 360 original format writing.
+struct Xbox360NodeData {
+    parent_index: u32,
     name_variant: u32,
     text_variant: u32,
-    first_attr: u16,
-    num_attrs: u16,
-    first_child: u16,
-    num_children: u16,
+    attributes: Vec<(u32, u32)>, // (name_variant, value_variant)
+    children_indices: Vec<u32>,
 }
 
-/// Packed attribute structure for writing.
-struct PackedAttribute {
-    name_variant: u32,
-    value_variant: u32,
+/// Variant data builder for Xbox 360 format.
+/// Combines string table and data table with proper offset handling.
+///
+/// IMPORTANT: Data table entries (floats, float vecs, int32s) store their offsets
+/// relative to data_table start. These offsets need to be adjusted when the builder
+/// is finalized, since string_data length is not known until all strings are added.
+struct VariantDataBuilder {
+    string_data: Vec<u8>,
+    data_table: Vec<u8>,
+    string_offsets: std::collections::HashMap<String, u32>,
+    /// Stores variant values that need fixup (their offsets are relative to data_table start)
+    data_table_fixups: Vec<u32>,
 }
 
-/// String table builder.
-struct StringTable {
-    data: Vec<u8>,
-    strings: std::collections::HashMap<String, u32>,
-}
-
-impl StringTable {
+impl VariantDataBuilder {
     fn new() -> Self {
         Self {
-            data: Vec::new(),
-            strings: std::collections::HashMap::new(),
+            string_data: Vec::new(),
+            data_table: Vec::new(),
+            string_offsets: std::collections::HashMap::new(),
+            data_table_fixups: Vec::new(),
         }
     }
 
     fn add_string(&mut self, s: &str) -> u32 {
-        if let Some(&offset) = self.strings.get(s) {
+        if let Some(&offset) = self.string_offsets.get(s) {
             return ((VariantType::String as u32 | OFFSET_FLAG as u32) << 24) | offset;
         }
-        let offset = self.data.len() as u32;
-        self.data.extend_from_slice(s.as_bytes());
-        self.data.push(0); // null terminator
-        self.strings.insert(s.to_string(), offset);
+        let offset = self.string_data.len() as u32;
+        self.string_data.extend_from_slice(s.as_bytes());
+        self.string_data.push(0); // null terminator
+        self.string_offsets.insert(s.to_string(), offset);
         ((VariantType::String as u32 | OFFSET_FLAG as u32) << 24) | offset
     }
 
     fn add_ustring(&mut self, s: &str) -> u32 {
-        // For UString, we store UTF-16LE
-        let offset = self.data.len() as u32;
+        let offset = self.string_data.len() as u32;
         for c in s.encode_utf16() {
-            self.data.push((c & 0xFF) as u8);
-            self.data.push((c >> 8) as u8);
+            self.string_data.push((c >> 8) as u8); // Big-endian
+            self.string_data.push((c & 0xFF) as u8);
         }
         // Null terminator (2 bytes for UTF-16)
-        self.data.push(0);
-        self.data.push(0);
+        self.string_data.push(0);
+        self.string_data.push(0);
         ((VariantType::UString as u32 | OFFSET_FLAG as u32) << 24) | offset
     }
-}
 
-/// Data table builder for storing Double, FloatVec, Int32, Float values.
-struct DataTable {
-    data: Vec<u8>,
-}
-
-impl DataTable {
-    fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    fn add_double(&mut self, v: f64) -> u32 {
-        let offset = self.data.len() as u32;
-        self.data.extend_from_slice(&v.to_be_bytes());
-        ((VariantType::Double as u32 | OFFSET_FLAG as u32) << 24) | offset
-    }
-
+    /// Add a float to data_table. Returns a variant value that needs fixup via `fixup_variant`.
     fn add_float(&mut self, v: f32) -> u32 {
-        let offset = self.data.len() as u32;
-        self.data.extend_from_slice(&v.to_be_bytes());
-        ((VariantType::Float as u32 | OFFSET_FLAG as u32) << 24) | offset
+        let data_table_offset = self.data_table.len() as u32;
+        self.data_table.extend_from_slice(&v.to_be_bytes());
+        // Store with NEEDS_FIXUP marker in bits 23-22 (we use 0x800000 as marker)
+        // The actual type byte goes in upper 8 bits, data_table_offset in lower 22 bits
+        let variant = ((VariantType::Float as u32 | OFFSET_FLAG as u32) << 24) | data_table_offset;
+        self.data_table_fixups.push(variant);
+        variant
     }
 
+    /// Add a double to data_table. Returns a variant value that needs fixup via `fixup_variant`.
+    fn add_double(&mut self, v: f64) -> u32 {
+        let data_table_offset = self.data_table.len() as u32;
+        self.data_table.extend_from_slice(&v.to_be_bytes());
+        let variant = ((VariantType::Double as u32 | OFFSET_FLAG as u32) << 24) | data_table_offset;
+        self.data_table_fixups.push(variant);
+        variant
+    }
+
+    /// Add an int32 to data_table. Returns a variant value that needs fixup via `fixup_variant`.
     fn add_int32(&mut self, v: i32) -> u32 {
-        let offset = self.data.len() as u32;
-        self.data.extend_from_slice(&v.to_be_bytes());
-        ((VariantType::Int32 as u32 | OFFSET_FLAG as u32) << 24) | offset
+        let data_table_offset = self.data_table.len() as u32;
+        self.data_table.extend_from_slice(&v.to_be_bytes());
+        let variant = ((VariantType::Int32 as u32 | OFFSET_FLAG as u32) << 24) | data_table_offset;
+        self.data_table_fixups.push(variant);
+        variant
     }
 
+    /// Add a float vector to data_table. Returns a variant value that needs fixup via `fixup_variant`.
     fn add_float_vec(&mut self, v: &[f32]) -> u32 {
-        let offset = self.data.len() as u32;
+        let data_table_offset = self.data_table.len() as u32;
         for f in v {
-            self.data.extend_from_slice(&f.to_be_bytes());
+            self.data_table.extend_from_slice(&f.to_be_bytes());
         }
         // Encode vector size in bits 5-6 (0=2, 1=3, 2=4)
         let vec_size_bits = match v.len() {
             2 => 0u32,
             3 => 1u32,
             4 => 2u32,
-            _ => 0u32, // Default to 2
+            _ => 0u32,
         };
-        ((VariantType::FloatVec as u32 | OFFSET_FLAG as u32 | (vec_size_bits << 5)) << 24) | offset
+        let variant = ((VariantType::FloatVec as u32 | OFFSET_FLAG as u32 | (vec_size_bits << 5))
+            << 24)
+            | data_table_offset;
+        self.data_table_fixups.push(variant);
+        variant
+    }
+
+    /// Adjust a variant value that references data_table.
+    /// Call this after all strings have been added but before writing the variant.
+    fn fixup_variant(&self, variant: u32) -> u32 {
+        // Check if this variant needs fixup (is in our fixup list)
+        if self.data_table_fixups.contains(&variant) {
+            // Add string_data.len() to the offset portion (lower 24 bits)
+            let type_byte = variant & 0xFF000000;
+            let data_offset = variant & 0x00FFFFFF;
+            let fixed_offset = data_offset + (self.string_data.len() as u32);
+            type_byte | fixed_offset
+        } else {
+            variant
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        let mut result = self.string_data;
+        result.extend_from_slice(&self.data_table);
+        result
     }
 }
 

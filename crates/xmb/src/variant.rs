@@ -1,51 +1,121 @@
 //! Variant types and encoding for XMB values.
 //!
-//! XMB uses a variant system to store values efficiently. Each variant has a
-//! 24-bit data field and an 8-bit type field with flags.
+//! XMB uses a variant system to store values efficiently. Each variant value
+//! is encoded as a 32-bit integer with the following layout:
+//!
+//! ```text
+//! Bits 31-24 (type byte):
+//!   Bit 7 (0x80): OFFSET_FLAG - Value is stored at an offset in data table
+//!   Bit 6 (0x40): UNSIGNED_FLAG (for integers) or VEC_SIZE high bit (for FloatVec)
+//!   Bit 5 (0x20): VEC_SIZE low bit (for FloatVec, encodes 2/3/4 components)
+//!   Bits 4-0: Variant type (0-10)
+//!
+//! Bits 23-0 (data):
+//!   For direct values: The actual value (Int24, Float24, Bool, etc.)
+//!   For offset values: Offset into the data/string table
+//! ```
+//!
+//! ## Variant Types
+//!
+//! | Type | Name     | Storage  | Description |
+//! |------|----------|----------|-------------|
+//! | 0    | Null     | Direct   | Empty/null value |
+//! | 1    | Float24  | Direct   | 24-bit packed float (1-bit sign, 6-bit exp, 17-bit mantissa) |
+//! | 2    | Float    | Offset   | 32-bit IEEE 754 float |
+//! | 3    | Int24    | Direct   | 24-bit integer (sign bit + 23-bit magnitude) |
+//! | 4    | Int32    | Offset   | 32-bit integer |
+//! | 5    | Fract24  | Direct   | 24-bit fixed-point (value × 10,000) |
+//! | 6    | Double   | Offset   | 64-bit IEEE 754 double |
+//! | 7    | Bool     | Direct   | Boolean (0=false, 1=true) |
+//! | 8    | String   | Either   | ANSI string (direct if ≤3 chars) |
+//! | 9    | UString  | Offset   | UTF-16 Unicode string |
+//! | 10   | FloatVec | Offset   | Float vector (2-4 components, size in bits 5-6) |
 
 use crate::error::{Error, Result};
+
+// ============================================================================
+// Variant Type Flags
+// ============================================================================
+
+/// Type mask for extracting the variant type (bits 0-4).
+///
+/// Apply this mask to the type byte to get the base variant type.
+/// ```
+/// # use xmb::variant::TYPE_MASK;
+/// let type_byte: u8 = 0x88; // String with OFFSET_FLAG
+/// let variant_type = type_byte & TYPE_MASK; // = 8 (String)
+/// ```
+pub const TYPE_MASK: u8 = 0x1F;
+
+/// Flag indicating the value is stored as an offset (bit 7).
+///
+/// When set, the 24-bit data field contains an offset into the data table.
+/// When clear, the 24-bit data field contains the value directly.
+pub const OFFSET_FLAG: u8 = 0x80;
+
+/// Flag indicating an unsigned integer (bit 6).
+///
+/// Only meaningful for Int24 type. When set, the value is unsigned.
+/// Note: This bit overlaps with VEC_SIZE_MASK for FloatVec type.
+pub const UNSIGNED_FLAG: u8 = 0x40;
+
+/// Mask for vector size bits (bits 5-6).
+///
+/// For FloatVec type, these bits encode the number of components:
+/// - 0b00 (0) = 2 components
+/// - 0b01 (1) = 3 components
+/// - 0b10 (2) = 4 components
+///
+/// Note: These bits overlap with UNSIGNED_FLAG for integer types.
+pub const VEC_SIZE_MASK: u8 = 0x60;
+
+/// Shift amount to extract vector size from type byte.
+pub const VEC_SIZE_SHIFT: u8 = 5;
+
+// ============================================================================
+// Variant Type Enum
+// ============================================================================
 
 /// Variant type enumeration matching the XMB format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum VariantType {
-    /// Null/empty value (always direct).
+    /// Null/empty value (always direct, data = 0).
     Null = 0,
-    /// 24-bit float (always direct).
+    /// 24-bit packed float (always direct).
+    /// Format: 1-bit sign + 6-bit exponent (bias 31) + 17-bit mantissa.
     Float24 = 1,
-    /// 32-bit float (always offset).
+    /// 32-bit IEEE 754 float (always offset).
     Float = 2,
     /// 24-bit integer (always direct).
+    /// Format: 1-bit sign + 23-bit magnitude.
+    /// Can be unsigned if UNSIGNED_FLAG is set.
     Int24 = 3,
     /// 32-bit integer (always offset).
     Int32 = 4,
-    /// 24-bit fixed-point fraction (value * 10,000, always direct).
+    /// 24-bit fixed-point fraction (always direct).
+    /// Value is stored as (value × 10,000), with sign bit.
     Fract24 = 5,
-    /// 64-bit double (always offset).
+    /// 64-bit IEEE 754 double (always offset).
     Double = 6,
-    /// Boolean - "true" or "false" (always direct).
+    /// Boolean value (always direct).
+    /// Data is 0 for false, 1 for true.
     Bool = 7,
-    /// ANSI string (direct or offset).
+    /// ANSI string (direct if ≤3 bytes, otherwise offset).
+    /// Direct strings pack up to 3 ASCII characters in the 24-bit data field.
     String = 8,
-    /// Unicode string (direct or offset).
+    /// Unicode string (always offset).
+    /// Stored as null-terminated UTF-16.
     UString = 9,
-    /// Float vector (2, 3, or 4 components, always offset).
+    /// Float vector with 2-4 components (always offset).
+    /// Component count encoded in VEC_SIZE bits: 0=2, 1=3, 2=4.
     FloatVec = 10,
 }
 
-/// Type mask for extracting the variant type.
-pub const TYPE_MASK: u8 = 0x1F;
-/// Flag indicating the value is stored as an offset.
-pub const OFFSET_FLAG: u8 = 0x80;
-/// Flag indicating an unsigned integer.
-pub const UNSIGNED_FLAG: u8 = 0x40;
-/// Mask for vector size (stored in bits 5-6 for FloatVec).
-pub const VEC_SIZE_MASK: u8 = 0x60;
-/// Shift for vector size bits.
-pub const VEC_SIZE_SHIFT: u8 = 5;
-
 impl VariantType {
     /// Parse a variant type from a raw byte.
+    ///
+    /// This extracts the type from the lower 5 bits of the type byte.
     pub fn from_byte(byte: u8) -> Result<Self> {
         match byte & TYPE_MASK {
             0 => Ok(VariantType::Null),
@@ -62,6 +132,76 @@ impl VariantType {
             n => Err(Error::InvalidVariantType(n)),
         }
     }
+
+    /// Returns true if this type always uses offset storage.
+    pub fn always_offset(&self) -> bool {
+        matches!(
+            self,
+            VariantType::Float | VariantType::Int32 | VariantType::Double | VariantType::FloatVec
+        )
+    }
+
+    /// Returns true if this type always uses direct storage.
+    pub fn always_direct(&self) -> bool {
+        matches!(
+            self,
+            VariantType::Null
+                | VariantType::Float24
+                | VariantType::Int24
+                | VariantType::Fract24
+                | VariantType::Bool
+        )
+    }
+
+    /// Returns true if this type can use either direct or offset storage.
+    pub fn can_be_direct_or_offset(&self) -> bool {
+        matches!(self, VariantType::String | VariantType::UString)
+    }
+}
+
+// ============================================================================
+// Variant Flag Helper Functions
+// ============================================================================
+
+/// Extract the variant type from a 32-bit variant value.
+///
+/// This reads the type from the upper byte (bits 24-28).
+pub fn extract_type(variant_value: u32) -> Result<VariantType> {
+    let type_byte = (variant_value >> 24) as u8;
+    VariantType::from_byte(type_byte)
+}
+
+/// Check if a variant value uses offset storage.
+pub fn is_offset(variant_value: u32) -> bool {
+    let type_byte = (variant_value >> 24) as u8;
+    (type_byte & OFFSET_FLAG) != 0
+}
+
+/// Check if a variant value represents an unsigned integer.
+///
+/// Only meaningful for Int24 type.
+pub fn is_unsigned(variant_value: u32) -> bool {
+    let type_byte = (variant_value >> 24) as u8;
+    (type_byte & UNSIGNED_FLAG) != 0
+}
+
+/// Extract the vector component count from a FloatVec variant value.
+///
+/// Returns 2, 3, or 4 based on the VEC_SIZE bits.
+pub fn extract_vec_size(variant_value: u32) -> usize {
+    let type_byte = (variant_value >> 24) as u8;
+    let size_bits = (type_byte & VEC_SIZE_MASK) >> VEC_SIZE_SHIFT;
+    match size_bits {
+        0 => 2,
+        1 => 3,
+        2 => 4,
+        _ => 2, // Default to 2
+    }
+}
+
+/// Extract the 24-bit data field from a variant value.
+pub fn extract_data(variant_value: u32) -> u32 {
+    variant_value & 0xFFFFFF
 }
 
 /// A variant value in the XMB format.

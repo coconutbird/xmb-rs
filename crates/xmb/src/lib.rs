@@ -11,6 +11,22 @@
 //! XMB files are stored inside ECF (Ensemble Common Format) containers. The
 //! format uses a variant system for storing values efficiently with different
 //! types like Float24, Int24, Fract24, etc.
+//!
+//! ## Supported Formats
+//!
+//! - **PC Format**: Used in Halo Wars Definitive Edition and Halo Wars 2.
+//!   Little-endian with 48-byte nodes.
+//! - **Xbox 360 Format**: Used in the original Halo Wars (2007).
+//!   Big-endian with 28-byte nodes using PackedArray format.
+//!
+//! ## Compression
+//!
+//! XMB files can be optionally compressed using BDeflateStream format.
+//! See [`ecf::deflate_stream`] for compression-related constants.
+//!
+//! ## ECF Flags
+//!
+//! See [`ecf::chunk_resource_flags`] for ECF chunk resource flags.
 
 pub mod ecf;
 pub mod error;
@@ -18,11 +34,20 @@ pub mod types;
 pub mod variant;
 pub mod xmb;
 
+// Re-export main types
 pub use ecf::{EcfChunkHeader, EcfHeader, EcfReader, EcfWriter};
 pub use error::{Error, Result};
 pub use types::{Attribute, Node, XmbData, XmbFormat};
 pub use variant::{Variant, VariantType};
 pub use xmb::{XmbReader, XmbWriter};
+
+// Re-export ECF constants
+pub use ecf::{
+    ECF_HEADER_MAGIC, XMB_ECF_FILE_ID, XMX_FILE_INFO_CHUNK_ID, XMX_PACKED_DATA_CHUNK_ID,
+};
+
+// Re-export variant flag constants
+pub use variant::{OFFSET_FLAG, TYPE_MASK, UNSIGNED_FLAG, VEC_SIZE_MASK, VEC_SIZE_SHIFT};
 
 #[cfg(test)]
 mod tests {
@@ -662,6 +687,205 @@ mod tests {
     }
 
     #[test]
+    fn test_xbox360_floatvec_roundtrip() {
+        // Test FloatVec attribute roundtrip specifically
+        let mut root = Node::new("Test");
+        let mut child = Node::new("Unit");
+        child.add_attribute(Attribute {
+            name: "Offset".to_string(),
+            value: Variant::FloatVec(vec![50.0, 0.0, 0.0]),
+        });
+        root.add_child(child);
+
+        let original = XmbData::with_root(root);
+
+        // Write in Xbox 360 format
+        let mut buffer = Cursor::new(Vec::new());
+        XmbWriter::write(&original, &mut buffer, XmbFormat::Xbox360)
+            .expect("Failed to write Xbox 360 XMB");
+
+        // Read back
+        buffer.set_position(0);
+        let read_back = XmbReader::read(buffer).expect("Failed to read Xbox 360 XMB");
+
+        let orig_root = original.root().expect("No original root");
+        let read_root = read_back.root().expect("No read root");
+
+        let orig_offset = &orig_root.children[0].attributes[0];
+        let read_offset = &read_root.children[0].attributes[0];
+
+        println!("Original Offset: {:?}", orig_offset.value);
+        println!("Read Offset: {:?}", read_offset.value);
+
+        assert_eq!(
+            orig_offset.value_string(),
+            read_offset.value_string(),
+            "FloatVec attribute value mismatch"
+        );
+    }
+
+    #[test]
+    fn test_xbox360_xml_floatvec_roundtrip() {
+        // Test XML -> XMB -> XML roundtrip for FloatVec on a CHILD node
+        let xml = r#"<?xml version="1.0"?>
+<Test>
+    <Unit Offset="50,0,0">
+        <Name>TestUnit</Name>
+    </Unit>
+</Test>"#;
+
+        // Parse XML
+        let xmb = XmbData::from_xml(xml).expect("Failed to parse XML");
+
+        // Check what we parsed
+        let parsed_root = xmb.root().expect("No root after XML parse");
+        let parsed_offset = &parsed_root.children[0].attributes[0];
+        println!(
+            "Parsed from XML (child attr) - Offset: {:?}",
+            parsed_offset.value
+        );
+
+        // Write in Xbox 360 format
+        let mut buffer = Cursor::new(Vec::new());
+        XmbWriter::write(&xmb, &mut buffer, XmbFormat::Xbox360)
+            .expect("Failed to write Xbox 360 XMB");
+
+        // Read back
+        buffer.set_position(0);
+        let read_back = XmbReader::read(buffer).expect("Failed to read Xbox 360 XMB");
+
+        let read_root = read_back.root().expect("No root after XMB read");
+        let read_offset = &read_root.children[0].attributes[0];
+        println!(
+            "Read from XMB (child attr) - Offset: {:?}",
+            read_offset.value
+        );
+
+        assert_eq!(
+            parsed_offset.value_string(),
+            read_offset.value_string(),
+            "FloatVec attribute value mismatch after XML -> XMB -> read roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_xbox360_simple_floatvec_on_root() {
+        // Test with FloatVec on root node (simpler case)
+        let mut root = Node::new("Test");
+        root.add_attribute(Attribute {
+            name: "Offset".to_string(),
+            value: Variant::FloatVec(vec![50.0, 0.0, 0.0]),
+        });
+
+        let original = XmbData::with_root(root);
+
+        println!(
+            "Original root attr: {:?}",
+            original.root().unwrap().attributes[0].value
+        );
+
+        // Write in Xbox 360 format
+        let mut buffer = Cursor::new(Vec::new());
+        XmbWriter::write(&original, &mut buffer, XmbFormat::Xbox360)
+            .expect("Failed to write Xbox 360 XMB");
+
+        // Read back
+        buffer.set_position(0);
+        let read_back = XmbReader::read(buffer).expect("Failed to read Xbox 360 XMB");
+
+        let read_root = read_back.root().expect("No root");
+        println!("Read root attr: {:?}", read_root.attributes[0].value);
+
+        assert_eq!(
+            original.root().unwrap().attributes[0].value_string(),
+            read_root.attributes[0].value_string(),
+            "FloatVec on root mismatch"
+        );
+    }
+
+    #[test]
+    fn test_xbox360_floatvec_with_child() {
+        // Test with FloatVec on child node (more complex)
+        let mut root = Node::new("Test");
+        let mut child = Node::new("Unit");
+        child.add_attribute(Attribute {
+            name: "Offset".to_string(),
+            value: Variant::FloatVec(vec![50.0, 0.0, 0.0]),
+        });
+        root.add_child(child);
+
+        let original = XmbData::with_root(root);
+
+        println!(
+            "Original child attr: {:?}",
+            original.root().unwrap().children[0].attributes[0].value
+        );
+
+        // Write in Xbox 360 format
+        let mut buffer = Cursor::new(Vec::new());
+        XmbWriter::write(&original, &mut buffer, XmbFormat::Xbox360)
+            .expect("Failed to write Xbox 360 XMB");
+
+        // Read back
+        buffer.set_position(0);
+        let read_back = XmbReader::read(buffer).expect("Failed to read Xbox 360 XMB");
+
+        let read_root = read_back.root().expect("No root");
+        println!(
+            "Read child attr: {:?}",
+            read_root.children[0].attributes[0].value
+        );
+
+        assert_eq!(
+            original.root().unwrap().children[0].attributes[0].value_string(),
+            read_root.children[0].attributes[0].value_string(),
+            "FloatVec on child mismatch"
+        );
+    }
+
+    #[test]
+    fn test_xbox360_floatvec_with_grandchild() {
+        // Test with FloatVec on child node that has a grandchild
+        let mut root = Node::new("Test");
+        let mut child = Node::new("Unit");
+        child.add_attribute(Attribute {
+            name: "Offset".to_string(),
+            value: Variant::FloatVec(vec![50.0, 0.0, 0.0]),
+        });
+        // Add a grandchild (this is what the XML test has)
+        child.add_child(Node::with_text("Name", "TestUnit"));
+        root.add_child(child);
+
+        let original = XmbData::with_root(root);
+
+        println!(
+            "Original child attr: {:?}",
+            original.root().unwrap().children[0].attributes[0].value
+        );
+
+        // Write in Xbox 360 format
+        let mut buffer = Cursor::new(Vec::new());
+        XmbWriter::write(&original, &mut buffer, XmbFormat::Xbox360)
+            .expect("Failed to write Xbox 360 XMB");
+
+        // Read back
+        buffer.set_position(0);
+        let read_back = XmbReader::read(buffer).expect("Failed to read Xbox 360 XMB");
+
+        let read_root = read_back.root().expect("No root");
+        println!(
+            "Read child attr: {:?}",
+            read_root.children[0].attributes[0].value
+        );
+
+        assert_eq!(
+            original.root().unwrap().children[0].attributes[0].value_string(),
+            read_root.children[0].attributes[0].value_string(),
+            "FloatVec on child with grandchild mismatch"
+        );
+    }
+
+    #[test]
     fn test_xbox360_format_roundtrip() {
         // Create a synthetic document for Xbox 360 format testing
         let mut root = Node::new("GameData");
@@ -690,14 +914,32 @@ mod tests {
         // Verify it was read as Xbox 360 format
         assert!(read_back.is_xbox360());
 
-        // Compare
+        // Compare structure
         let orig_root = original.root().expect("No original root");
         let read_root = read_back.root().expect("No read root");
 
         assert_eq!(orig_root.name, read_root.name);
         assert_eq!(orig_root.children.len(), read_root.children.len());
 
-        println!("Xbox 360 format roundtrip successful!");
+        // Verify children structure
+        for (i, (orig_child, read_child)) in orig_root
+            .children
+            .iter()
+            .zip(read_root.children.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                orig_child.name, read_child.name,
+                "Child {} name mismatch",
+                i
+            );
+            assert_eq!(
+                orig_child.children.len(),
+                read_child.children.len(),
+                "Child {} children count mismatch",
+                i
+            );
+        }
     }
 
     // ==================== FORMAT ROUNDTRIP TESTS ====================

@@ -24,6 +24,10 @@ struct Cli {
     /// Overwrite existing files instead of adding _1, _2, etc.
     #[arg(short = 'w', long, global = true)]
     overwrite: bool,
+
+    /// Disable compression when writing XMB files (compressed by default)
+    #[arg(short = 'u', long = "no-compress", global = true)]
+    no_compress: bool,
 }
 
 #[derive(Subcommand)]
@@ -84,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // If files are provided without a subcommand, use drag-and-drop mode
     if cli.command.is_none() && !cli.files.is_empty() {
-        return process_files(&cli.files, cli.format, cli.overwrite);
+        return process_files(&cli.files, cli.format, cli.overwrite, !cli.no_compress);
     }
 
     match cli.command {
@@ -118,11 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 p
             });
 
+            let compress = !cli.no_compress;
             println!(
-                "Converting {} -> {} ({:?} format)",
+                "Converting {} -> {} ({:?} format{})",
                 input.display(),
                 output.display(),
-                format
+                format,
+                if compress { ", compressed" } else { "" }
             );
 
             let xml = std::fs::read_to_string(&input)?;
@@ -130,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let file = File::create(&output)?;
             let writer = BufWriter::new(file);
-            XmbWriter::write(&xmb, writer, format.into())?;
+            XmbWriter::write_with_options(&xmb, writer, format.into(), compress)?;
 
             println!("Done!");
         }
@@ -202,6 +208,7 @@ fn process_files(
     files: &[PathBuf],
     format: FormatArg,
     overwrite: bool,
+    compress: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut success_count = 0;
     let mut error_count = 0;
@@ -213,7 +220,7 @@ fn process_files(
             .unwrap_or_default();
 
         let result = match ext.as_str() {
-            "xml" => convert_xml_to_xmb(file, format, overwrite),
+            "xml" => convert_xml_to_xmb(file, format, overwrite, compress),
             "xmb" => convert_xmb_to_xml(file, overwrite),
             _ => {
                 eprintln!("Skipping {}: unknown extension", file.display());
@@ -248,6 +255,7 @@ fn convert_xml_to_xmb(
     input: &PathBuf,
     format: FormatArg,
     overwrite: bool,
+    compress: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let output = output_path(input, "xmb", overwrite);
 
@@ -256,7 +264,7 @@ fn convert_xml_to_xmb(
 
     let file = File::create(&output)?;
     let writer = BufWriter::new(file);
-    XmbWriter::write(&xmb, writer, format.into())?;
+    XmbWriter::write_with_options(&xmb, writer, format.into(), compress)?;
 
     Ok(output)
 }
